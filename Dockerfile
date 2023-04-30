@@ -3,6 +3,7 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG VERSION
+ENV VERSION=3.2.6
 ENV BUILDX_ARCH="${TARGETOS:-linux}_${TARGETARCH:-amd64}${TARGETVARIANT}"
 WORKDIR /app
 RUN wget https://github.com/seriousm4x/UpSnap/releases/download/${VERSION}/UpSnap_${VERSION}_${BUILDX_ARCH}.zip &&\
@@ -17,5 +18,5 @@ RUN apk update &&\
 WORKDIR /app
 COPY --from=downloader /app/upsnap upsnap
 HEALTHCHECK --interval=10s \
-    CMD curl -fs "http://localhost:8090/api/health" || exit 1
-ENTRYPOINT ["./upsnap", "serve", "--http=0.0.0.0:8090"]
+    CMD curl -fs "http://localhost:5555/api/health" || exit 1
+ENTRYPOINT ["./upsnap", "serve", "--http=0.0.0.0:5555"]
