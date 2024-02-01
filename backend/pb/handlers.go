@@ -4,9 +4,11 @@ import (
 	"encoding/xml"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v5"
 	"github.com/pocketbase/pocketbase/apis"
@@ -20,16 +22,74 @@ func HandlerWake(c echo.Context) error {
 	if err != nil {
 		return apis.NewNotFoundError("The device does not exist.", err)
 	}
-	go func(*models.Record) {
-		record.Set("status", "pending")
-		App.Dao().SaveRecord(record)
-		if err := networking.WakeDevice(record); err != nil {
+	record.Set("status", "pending")
+	if err := App.Dao().SaveRecord(record); err != nil {
+		logger.Error.Println("Failed to save record:", err)
+	}
+	go func(r *models.Record) {
+		if err := networking.WakeDevice(r); err != nil {
 			logger.Error.Println(err)
-			record.Set("status", "offline")
+			r.Set("status", "offline")
 		} else {
-			record.Set("status", "online")
+			r.Set("status", "online")
 		}
-		App.Dao().SaveRecord(record)
+		if err := App.Dao().SaveRecord(r); err != nil {
+			logger.Error.Println("Failed to save record:", err)
+		}
+	}(record)
+	return c.JSON(http.StatusOK, record)
+}
+
+func HandlerSleep(c echo.Context) error {
+	record, err := App.Dao().FindFirstRecordByData("devices", "id", c.PathParam("id"))
+	if err != nil {
+		return apis.NewNotFoundError("The device does not exist.", err)
+	}
+	record.Set("status", "pending")
+	if err := App.Dao().SaveRecord(record); err != nil {
+		logger.Error.Println("Failed to save record:", err)
+	}
+	resp, err := networking.SleepDevice(record)
+	if err != nil {
+		logger.Error.Println(err)
+		record.Set("status", "online")
+		if err := App.Dao().SaveRecord(record); err != nil {
+			logger.Error.Println("Failed to save record:", err)
+		}
+		return apis.NewBadRequestError(resp.Message, nil)
+	}
+	record.Set("status", "offline")
+	if err := App.Dao().SaveRecord(record); err != nil {
+		logger.Error.Println("Failed to save record:", err)
+	}
+	return c.JSON(http.StatusOK, nil)
+}
+
+func HandlerReboot(c echo.Context) error {
+	record, err := App.Dao().FindFirstRecordByData("devices", "id", c.PathParam("id"))
+	if err != nil {
+		return apis.NewNotFoundError("The device does not exist.", err)
+	}
+	record.Set("status", "pending")
+	if err := App.Dao().SaveRecord(record); err != nil {
+		logger.Error.Println("Failed to save record:", err)
+	}
+	go func(r *models.Record) {
+		if err := networking.ShutdownDevice(r); err != nil {
+			logger.Error.Println(err)
+			r.Set("status", "online")
+		} else {
+			time.Sleep(15 * time.Second) // some devices might not respond to ping but are still shutting down
+			if err := networking.WakeDevice(r); err != nil {
+				logger.Error.Println(err)
+				r.Set("status", "offline")
+			} else {
+				r.Set("status", "online")
+			}
+		}
+		if err := App.Dao().SaveRecord(r); err != nil {
+			logger.Error.Println("Failed to save record:", err)
+		}
 	}(record)
 	return c.JSON(http.StatusOK, record)
 }
@@ -39,16 +99,20 @@ func HandlerShutdown(c echo.Context) error {
 	if err != nil {
 		return apis.NewNotFoundError("The device does not exist.", err)
 	}
-	go func(*models.Record) {
-		record.Set("status", "pending")
-		App.Dao().SaveRecord(record)
-		if err := networking.ShutdownDevice(record); err != nil {
+	record.Set("status", "pending")
+	if err := App.Dao().SaveRecord(record); err != nil {
+		logger.Error.Println("Failed to save record:", err)
+	}
+	go func(r *models.Record) {
+		if err := networking.ShutdownDevice(r); err != nil {
 			logger.Error.Println(err)
-			record.Set("status", "online")
+			r.Set("status", "online")
 		} else {
-			record.Set("status", "offline")
+			r.Set("status", "offline")
 		}
-		App.Dao().SaveRecord(record)
+		if err := App.Dao().SaveRecord(r); err != nil {
+			logger.Error.Println("Failed to save record:", err)
+		}
 	}(record)
 	return c.JSON(http.StatusOK, record)
 }
@@ -65,7 +129,8 @@ type Nmaprun struct {
 
 func HandlerScan(c echo.Context) error {
 	// check if nmap installed
-	if _, err := exec.LookPath("nmap"); err != nil {
+	nmap, err := exec.LookPath("nmap")
+	if err != nil {
 		return apis.NewBadRequestError(err.Error(), nil)
 	}
 
@@ -82,7 +147,11 @@ func HandlerScan(c echo.Context) error {
 	}
 
 	// run nmap
-	cmd := exec.Command("nmap", "-sn", "-oX", "-", scanRange, "--host-timeout", "500ms")
+	timeout := os.Getenv("UPSNAP_SCAN_TIMEOUT")
+	if timeout == "" {
+		timeout = "500ms"
+	}
+	cmd := exec.Command(nmap, "-sn", "-oX", "-", scanRange, "--host-timeout", timeout)
 	cmdOutput, err := cmd.Output()
 	if err != nil {
 		return err
@@ -95,9 +164,10 @@ func HandlerScan(c echo.Context) error {
 	}
 
 	type Device struct {
-		Name string `json:"name"`
-		IP   string `json:"ip"`
-		MAC  string `json:"mac"`
+		Name      string `json:"name"`
+		IP        string `json:"ip"`
+		MAC       string `json:"mac"`
+		MACVendor string `json:"mac_vendor"`
 	}
 
 	// extract info from struct into data
@@ -121,15 +191,27 @@ func HandlerScan(c echo.Context) error {
 				dev.MAC = addr.Addr
 			}
 			if addr.Vendor != "" {
-				dev.Name = addr.Vendor
+				dev.MACVendor = addr.Vendor
+			} else {
+				dev.MACVendor = "Unknown"
 			}
 		}
+
 		if dev.IP == "" || dev.MAC == "" {
 			continue
 		}
-		if dev.Name == "" {
-			dev.Name = "Unknown"
+
+		names, err := net.LookupAddr(dev.IP)
+		if err != nil || len(names) == 0 {
+			dev.Name = dev.MACVendor
+		} else {
+			dev.Name = strings.TrimSuffix(names[0], ".")
 		}
+
+		if dev.Name == "" && dev.MACVendor == "" {
+			continue
+		}
+
 		res.Devices = append(res.Devices, dev)
 	}
 

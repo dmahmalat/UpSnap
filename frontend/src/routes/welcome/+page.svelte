@@ -1,0 +1,176 @@
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { toggleVisibility } from '$lib/helpers/forms';
+	import LL from '$lib/i18n/i18n-svelte';
+	import { pocketbase } from '$lib/stores/pocketbase';
+	import { settingsPub } from '$lib/stores/settings';
+	import { faArrowRight, faEye } from '@fortawesome/free-solid-svg-icons';
+	import { onMount } from 'svelte';
+	import Fa from 'svelte-fa';
+	import toast from 'svelte-french-toast';
+
+	let stepsCompleted = 0;
+	let inputPassword: HTMLInputElement;
+	let inputConfirm: HTMLInputElement;
+	let form = {
+		email: '',
+		password: '',
+		confirm: ''
+	};
+
+	onMount(() => {
+		if ($settingsPub && $settingsPub.setup_completed === false && $pocketbase.authStore.isValid) {
+			$pocketbase.authStore.clear();
+		}
+	});
+
+	async function register() {
+		$pocketbase.admins
+			.create({
+				email: form.email,
+				password: form.password,
+				passwordConfirm: form.confirm
+			})
+			.then(() => {
+				$pocketbase.admins
+					.authWithPassword(form.email, form.password)
+					.then(() => {
+						stepsCompleted = 2;
+					})
+					.catch((err) => {
+						if (err.data?.data?.identity?.message) {
+							toast.error(err.data.data.identity.message);
+							return;
+						}
+					});
+			})
+			.catch((err) => {
+				if (err.data?.data?.passwordConfirm?.message) {
+					toast.error($LL.toasts.passwords_missmatch());
+				} else if (err.data?.data?.email?.message) {
+					toast.error(err.data.data.email.message);
+				} else {
+					toast.error(err.message || err);
+				}
+			});
+	}
+</script>
+
+<div class="mt-10 flex items-center justify-center">
+	<div class="flex flex-col gap-16 w-screen max-w-lg my-4">
+		<div class="card bg-base-300 shadow-xl">
+			{#if $settingsPub?.setup_completed}
+				<figure class="w-72 mx-auto pt-6"><img src="/gopher.svg" alt="Gopher" /></figure>
+				<div class="card-body">
+					<h2 class="card-title">{$LL.welcome.not_expected_title()}</h2>
+					<p>{$LL.welcome.not_expected_desc()}</p>
+					<div class="card-actions justify-end">
+						<button class="btn btn-primary" on:click={() => goto('/')}
+							>{$LL.welcome.not_expected_back()}</button
+						>
+					</div>
+				</div>
+			{:else if stepsCompleted === 0}
+				<figure class="w-44 mx-auto pt-6"><img src="/gopher.svg" alt="Gopher" /></figure>
+				<div class="card-body">
+					<h2 class="card-title">{$LL.welcome.step1_page_title()}</h2>
+					<p>{$LL.welcome.step1_setup_desc()}</p>
+					<div class="card-actions justify-end">
+						<button class="btn btn-primary" on:click={() => (stepsCompleted = 1)}
+							>{$LL.welcome.step1_setup_btn_next()} <Fa icon={faArrowRight} /></button
+						>
+					</div>
+				</div>
+			{:else if stepsCompleted === 1}
+				<div class="card-body">
+					<div class="flex flex-row gap-4">
+						<figure class="w-16"><img src="/gopher.svg" alt="Gopher" /></figure>
+						<h2 class="card-title">{$LL.welcome.step2_page_title()}</h2>
+					</div>
+					<form class="form-control w-full" on:submit|preventDefault={register}>
+						<label class="label" for="email">
+							<span class="label-text">{$LL.welcome.step2_label_email()}</span>
+						</label>
+						<input
+							id="email"
+							type="email"
+							class="input input-bordered w-full"
+							required
+							bind:value={form.email}
+						/>
+						<label class="label" for="password">
+							<span class="label-text">{$LL.welcome.step2_label_password()}</span>
+							<span class="label-text-alt">{$LL.welcome.step2_label_min_chars()}</span>
+						</label>
+						<label class="relative block">
+							<div
+								class="absolute top-1/2 -translate-y-1/2 right-4 cursor-pointer"
+								role="none"
+								on:click={() => toggleVisibility(inputPassword)}
+								on:keydown={() => toggleVisibility(inputPassword)}
+							>
+								<Fa icon={faEye} />
+							</div>
+							<input
+								id="password"
+								type="password"
+								class="input input-bordered w-full"
+								minlength="10"
+								maxlength="72"
+								required
+								bind:value={form.password}
+								bind:this={inputPassword}
+							/>
+						</label>
+						<label class="label" for="passwordConfirm">
+							<span class="label-text">{$LL.welcome.step2_label_password_confirm()}</span>
+						</label>
+						<label class="relative block">
+							<div
+								class="absolute top-1/2 -translate-y-1/2 right-4 cursor-pointer"
+								role="none"
+								on:click={() => toggleVisibility(inputConfirm)}
+								on:keydown={() => toggleVisibility(inputConfirm)}
+							>
+								<Fa icon={faEye} />
+							</div>
+							<input
+								id="confirm"
+								type="password"
+								class="input input-bordered w-full"
+								minlength="10"
+								maxlength="72"
+								required
+								bind:value={form.confirm}
+								bind:this={inputConfirm}
+							/>
+						</label>
+						<div class="card-actions justify-end mt-4">
+							<button class="btn btn-primary" type="submit"
+								>{$LL.welcome.step2_btn_create()} <Fa icon={faArrowRight} /></button
+							>
+						</div>
+					</form>
+				</div>
+			{:else if stepsCompleted === 2}
+				<figure class="w-72 mx-auto pt-6"><img src="/gopher.svg" alt="Gopher" /></figure>
+				<div class="card-body">
+					<h2 class="card-title">{$LL.welcome.step3_page_title()}</h2>
+					<p>{$LL.welcome.step3_page_desc()}</p>
+					<div class="card-actions justify-end">
+						<button class="btn btn-success" on:click={() => goto('/')}
+							>{$LL.welcome.step3_btn_done()}</button
+						>
+					</div>
+				</div>
+			{/if}
+		</div>
+		{#if !$settingsPub?.setup_completed}
+			<ul class="steps steps-horizontal">
+				<li class="step step-primary">{$LL.welcome.progress_step1()}</li>
+				<li class="step" class:step-primary={stepsCompleted > 0}>{$LL.welcome.progress_step2()}</li>
+				<li class="step" class:step-primary={stepsCompleted > 1}>{$LL.welcome.progress_step3()}</li>
+			</ul>
+		{/if}
+	</div>
+</div>

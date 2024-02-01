@@ -1,140 +1,139 @@
-<script>
-    import { dev } from '$app/environment';
-    import { onMount } from 'svelte';
-    import { page } from '$app/stores';
-    import Navbar from '@components/Navbar.svelte';
-    import Login from '@components/Login.svelte';
-    import Transition from '@components/Transition.svelte';
-    import { theme } from '@stores/theme';
-    import {
-        pocketbase,
-        authorizedStore,
-        devices,
-        settings_private,
-        settings_public
-    } from '@stores/pocketbase';
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
+	import Navbar from '$lib/components/Navbar.svelte';
+	import Transition from '$lib/components/Transition.svelte';
+	import LL, { setLocale } from '$lib/i18n/i18n-svelte';
+	import { baseLocale, locales } from '$lib/i18n/i18n-util';
+	import { loadLocaleAsync } from '$lib/i18n/i18n-util.async';
+	import { backendUrl, permission, pocketbase } from '$lib/stores/pocketbase';
+	import { settingsPub } from '$lib/stores/settings';
+	import type { Permission } from '$lib/types/permission';
+	import type { SettingsPublic } from '$lib/types/settings';
+	import { onMount } from 'svelte';
+	import toast, { Toaster, type ToastOptions } from 'svelte-french-toast';
+	import { detectLocale, localStorageDetector, navigatorDetector } from 'typesafe-i18n/detectors';
+	import '../app.css';
 
-    let favicon;
-    let preferesDark;
-    let isAuth = false;
+	const toastOptions: ToastOptions = {
+		duration: 5000
+	};
 
-    onMount(async () => {
-        // import bootstrap js
-        import('bootstrap/js/dist/dropdown');
-        import('bootstrap/js/dist/collapse');
+	onMount(async () => {
+		// load locale
+		const detectedLocale = detectLocale(
+			baseLocale,
+			locales,
+			localStorageDetector,
+			navigatorDetector
+		);
+		await loadLocaleAsync(detectedLocale);
+		setLocale(detectedLocale);
 
-        // set dark mode
-        preferesDark = window.matchMedia('(prefers-color-scheme: dark)');
-        preferesDark.addEventListener('change', (e) => {
-            if ($theme === 'auto') {
-                document.documentElement.setAttribute(
-                    'data-bs-theme',
-                    e.matches ? 'dark' : 'light'
-                );
-            }
-        });
+		$pocketbase.authStore.onChange(() => {
+			// load user permissions
+			if ($pocketbase.authStore.model?.collectionName === 'users') {
+				$pocketbase
+					.collection('permissions')
+					.getFirstListItem(`user.id = '${$pocketbase.authStore.model.id}'`)
+					.then((data) => {
+						permission.set(data as Permission);
+					})
+					.catch(() => {
+						return;
+					});
 
-        theme.subscribe((t) => {
-            localStorage.setItem('theme', t);
-            if (t === 'auto') {
-                t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-            }
-            document.documentElement.setAttribute('data-bs-theme', t);
-        });
+				$pocketbase.collection('permissions').subscribe('*', (event) => {
+					permission.set(event.record as Permission);
+					toast.success($LL.toasts.permissions_updated_personal());
+				});
+			}
+		});
 
-        authorizedStore.subscribe((state) => {
-            isAuth = state;
-        });
+		// set settingsPub store on load
+		if (!$settingsPub) {
+			const res = await $pocketbase.collection('settings_public').getFirstListItem('');
+			settingsPub.set(res as SettingsPublic);
+		}
 
-        // load public settings and subscribe to changes and change favicon
-        const settingsPublicRes = await $pocketbase.collection('settings_public').getList(1, 1);
-        settings_public.set(settingsPublicRes.items[0]);
-        updateSettingsPublic();
-        $pocketbase.collection('settings_public').subscribe('*', function (e) {
-            settings_public.set(e.record);
-            updateSettingsPublic();
-        });
+		// redirect to welcome page if setup is not completed
+		if ($settingsPub.setup_completed === false && $page.url.pathname !== '/welcome') {
+			goto('/welcome');
+			return;
+		}
 
-        // load auth from localstorage
-        const pbCookie = localStorage.getItem('pocketbase_auth');
-        if (pbCookie) {
-            $pocketbase.authStore.loadFromCookie('pb_auth=' + pbCookie);
+		// load auth from localstorage
+		const pbCookie = localStorage.getItem('pocketbase_auth');
+		if (!pbCookie) {
+			goto('/login');
+			return;
+		}
 
-            // try to refresh auth token if valid
-            if ($pocketbase.authStore.isValid) {
-                if ($pocketbase.authStore.model?.collectionName === 'users') {
-                    await $pocketbase.collection('users').authRefresh();
-                } else {
-                    await $pocketbase.admins.authRefresh();
-                }
-            }
-            authorizedStore.set($pocketbase.authStore.isValid);
-        }
-    });
+		$pocketbase.authStore.loadFromCookie('pb_auth=' + pbCookie);
+		if (!$pocketbase.authStore.isValid) {
+			goto('/login');
+			return;
+		}
 
-    function updateSettingsPublic() {
-        favicon.href =
-            $settings_public.favicon === ''
-                ? '/gopher.svg'
-                : `${dev ? $pocketbase.baseUrl : ''}/api/files/settings_public/${
-                      $settings_public.id
-                  }/${$settings_public.favicon}`;
-        document.title =
-            $settings_public.website_title === '' ? 'UpSnap' : $settings_public.website_title;
-    }
+		// only refresh token if valid less than 1 day
+		const jwt = parseJwt($pocketbase.authStore.token);
+		if (jwt.exp > Date.now() / 1000 + 60 * 60 * 24) {
+			return;
+		}
 
-    async function getSettingsPrivateAndDevices() {
-        if ($pocketbase.authStore.model?.collectionName !== 'users') {
-            const settingsPrivateRes = await $pocketbase
-                .collection('settings_private')
-                .getList(1, 1);
-            settings_private.set(settingsPrivateRes.items[0]);
-        }
+		if ($pocketbase.authStore.isAdmin) {
+			await $pocketbase.admins.authRefresh().catch(() => {
+				goto('/login');
+			});
+		} else {
+			await $pocketbase
+				.collection('users')
+				.authRefresh()
+				.catch(() => {
+					goto('/login');
+				});
+		}
+	});
 
-        let tempDevices = {};
-        const devicesRes = await $pocketbase.collection('devices').getFullList(200, {
-            sort: 'name',
-            expand: 'ports'
-        });
-        devicesRes.forEach((device) => {
-            tempDevices[device.id] = device;
-        });
-        devices.set(tempDevices);
-    }
+	function parseJwt(token: string) {
+		var base64Url = token.split('.')[1];
+		var base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+		var jsonPayload = decodeURIComponent(
+			window
+				.atob(base64)
+				.split('')
+				.map(function (c) {
+					return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+				})
+				.join('')
+		);
 
-    $: if (isAuth) {
-        getSettingsPrivateAndDevices();
-    }
+		return JSON.parse(jsonPayload);
+	}
 </script>
 
 <svelte:head>
-    <link rel="shortcut icon" href="/gopher.svg" bind:this={favicon} />
-    <script>
-        if (document) {
-            preferesDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-                ? 'dark'
-                : 'light';
-            let t = localStorage.getItem('theme');
-            if (!t) {
-                localStorage.setItem('theme', 'auto');
-                t = preferesDark;
-            } else if (t === 'auto') {
-                t = preferesDark;
-            }
-            document.documentElement.setAttribute('data-bs-theme', t);
-        }
-    </script>
+	<link
+		rel="shortcut icon"
+		href={$settingsPub?.id && $settingsPub?.favicon
+			? `${backendUrl}api/files/settings_public/${$settingsPub?.id}/${$settingsPub?.favicon}`
+			: '/gopher.svg'}
+	/>
+	{#if $settingsPub === undefined}
+		<title>UpSnap</title>
+	{:else}
+		<title>{$settingsPub.website_title === '' ? 'UpSnap' : $settingsPub.website_title}</title>
+	{/if}
 </svelte:head>
 
-{#if isAuth}
-    <Navbar />
-    <Transition url={$page.url}>
-        <slot />
-    </Transition>
-{:else}
-    <Login />
+{#if $pocketbase.authStore.isValid}
+	<Navbar />
 {/if}
 
-<style lang="scss" global>
-    @import '../scss/main.scss';
-</style>
+<Toaster position="bottom-center" {toastOptions} />
+
+<Transition url={$page.url}>
+	<div class="container mx-auto p-2 mb-4">
+		<slot />
+	</div>
+</Transition>

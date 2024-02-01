@@ -1,22 +1,46 @@
-<script>
-    import { devices } from '@stores/pocketbase';
-    import DeviceForm from '@components/DeviceForm.svelte';
-    import UnauthorizedMsg from '@components/UnauthorizedMsg.svelte';
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
+	import DeviceForm from '$lib/components/DeviceForm.svelte';
+	import PageLoading from '$lib/components/PageLoading.svelte';
+	import LL from '$lib/i18n/i18n-svelte';
+	import { permission, pocketbase } from '$lib/stores/pocketbase';
+	import type { Device, Port } from '$lib/types/device';
+	import toast from 'svelte-french-toast';
 
-    export let data;
-    let device;
+	$: if (Object.hasOwn($permission, 'update')) {
+		if (!$pocketbase.authStore.isAdmin && !$permission.update.includes($page.params.id)) {
+			toast($LL.toasts.no_permission({ url: $page.url.pathname }), {
+				icon: '⛔'
+			});
+			goto('/');
+		}
+	}
 
-    $: {
-        device = $devices[data.params.id];
-        if (device && !device?.expand?.ports) {
-            device.expand.ports = [];
-        }
-    }
+	async function getDevice(): Promise<Device> {
+		const resp = await $pocketbase
+			.collection('devices')
+			.getOne($page.params.id, { expand: 'ports,groups' });
+
+		let device = resp as Device;
+
+		if (!device.expand) device.expand = {};
+
+		if (!device.expand.ports) {
+			device.expand.ports = [] as Port[];
+		}
+
+		return resp as Device;
+	}
 </script>
 
-{#if device}
-    <div class="container">
-        <UnauthorizedMsg />
-        <DeviceForm bind:device mode="edit" />
-    </div>
-{/if}
+{#await getDevice()}
+	<PageLoading />
+{:then device}
+	<h1 class="text-3xl font-bold mb-8 sm:break-all">{device.name}</h1>
+	<DeviceForm {device} />
+{:catch err}
+	<div class="container max-w-lg mx-auto">
+		{err}
+	</div>
+{/await}

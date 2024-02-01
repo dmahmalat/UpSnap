@@ -1,9 +1,11 @@
 package pb
 
 import (
+	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
+	"path"
 
 	"github.com/labstack/echo/v5"
 	"github.com/pocketbase/pocketbase"
@@ -20,43 +22,88 @@ var App *pocketbase.PocketBase
 var Version = "(untracked)"
 
 func StartPocketBase(distDirFS fs.FS) {
-	App = pocketbase.New()
+	// set data dir
+	// use "./pb_data" if it's in the same dir as upsnap binary
+	// else use os.UserConfigDir() / upsnap
+	var dataDir string
+	baseDir, err := os.Getwd()
+	if err != nil {
+		logger.Error.Fatalln(err)
+	}
+	pb_data := path.Join(baseDir, "pb_data")
+	if _, err = os.Stat(pb_data); err == nil {
+		dataDir = pb_data
+	} else if os.IsNotExist(err) {
+		userConfigDir, err := os.UserConfigDir()
+		if err != nil {
+			logger.Error.Fatalln(err)
+		}
+		upsnap_data := path.Join(userConfigDir, "upsnap")
+		if _, err = os.Stat(upsnap_data); err == nil {
+			dataDir = upsnap_data
+		} else if os.IsNotExist(err) {
+			if err := os.MkdirAll(upsnap_data, 0700); err != nil {
+				logger.Error.Fatalln(err)
+			}
+		}
+	}
+
+	// create app
+	App = pocketbase.NewWithConfig(pocketbase.Config{
+		DefaultDataDir: dataDir,
+	})
 	App.RootCmd.Short = "UpSnap CLI"
 	App.RootCmd.Version = Version
 
 	// auto migrate db
-	migratecmd.MustRegister(App, App.RootCmd, &migratecmd.Options{
+	migratecmd.MustRegister(App, App.RootCmd, migratecmd.Config{
 		Automigrate: true,
 	})
 
 	// event hooks
 	App.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-		// set static website path
 		e.Router.GET("/*", apis.StaticDirectoryHandler(distDirFS, true))
 
-		// add wake route to api
 		e.Router.AddRoute(echo.Route{
 			Method:  http.MethodGet,
 			Path:    "/api/upsnap/wake/:id",
 			Handler: HandlerWake,
 			Middlewares: []echo.MiddlewareFunc{
 				apis.ActivityLogger(App),
-				apis.RequireAdminOrRecordAuth("users"),
+				RequireUpSnapPermission(),
 			},
 		})
 
-		// add shutdown route to api
+		e.Router.AddRoute(echo.Route{
+			Method:  http.MethodGet,
+			Path:    "/api/upsnap/sleep/:id",
+			Handler: HandlerSleep,
+			Middlewares: []echo.MiddlewareFunc{
+				apis.ActivityLogger(App),
+				RequireUpSnapPermission(),
+			},
+		})
+
+		e.Router.AddRoute(echo.Route{
+			Method:  http.MethodGet,
+			Path:    "/api/upsnap/reboot/:id",
+			Handler: HandlerReboot,
+			Middlewares: []echo.MiddlewareFunc{
+				apis.ActivityLogger(App),
+				RequireUpSnapPermission(),
+			},
+		})
+
 		e.Router.AddRoute(echo.Route{
 			Method:  http.MethodGet,
 			Path:    "/api/upsnap/shutdown/:id",
 			Handler: HandlerShutdown,
 			Middlewares: []echo.MiddlewareFunc{
 				apis.ActivityLogger(App),
-				apis.RequireAdminOrRecordAuth("users"),
+				RequireUpSnapPermission(),
 			},
 		})
 
-		// add network scan route to api
 		e.Router.AddRoute(echo.Route{
 			Method:  http.MethodGet,
 			Path:    "/api/upsnap/scan",
@@ -67,55 +114,78 @@ func StartPocketBase(distDirFS fs.FS) {
 			},
 		})
 
-		// import environment and set settings
 		if err := importSettings(); err != nil {
 			return err
 		}
 
-		// reset device states and run ping cronjob
 		if err := resetDeviceStates(); err != nil {
 			return err
 		}
 
-		// run cronjobs
-		go cronjobs.RunPing(App)
-		go cronjobs.RunWakeShutdown(App)
+		cronjobs.SetPingJobs(App)
+		cronjobs.StartPing()
+		cronjobs.SetWakeShutdownJobs(App)
+		cronjobs.StartWakeShutdown()
 
 		// restart ping cronjobs or wake/shutdown cronjobs on model update
 		// add event hook before starting server.
 		// using this outside App.OnBeforeServe() would not work
-		App.OnModelAfterUpdate().Add(func(e *core.ModelEvent) error {
+		App.OnModelAfterUpdate("settings_private", "devices").Add(func(e *core.ModelEvent) error {
 			if e.Model.TableName() == "settings_private" {
-				for _, job := range cronjobs.CronPing.Entries() {
-					cronjobs.CronPing.Remove(job.ID)
-				}
-				go cronjobs.RunPing(App)
+				cronjobs.SetPingJobs(App)
 			} else if e.Model.TableName() == "devices" {
-				if err := refreshDeviceList(); err != nil {
-					logger.Error.Println(err)
-					return err
+				// only restart wake/shutdown cronjobs if new model's cron changed
+				newRecord := e.Model.(*models.Record)
+				newWakeCron := newRecord.GetString("wake_cron")
+				newWakeCronEnabled := newRecord.GetBool("wake_cron_enabled")
+				newShutdownCron := newRecord.GetString("shutdown_cron")
+				newShutdownCronEnabled := newRecord.GetBool("shutdown_cron_enabled")
+
+				oldRecord := newRecord.OriginalCopy()
+				oldWakeCron := oldRecord.GetString("wake_cron")
+				oldWakeCronEnabled := oldRecord.GetBool("wake_cron_enabled")
+				oldShutdownCron := oldRecord.GetString("shutdown_cron")
+				oldShutdownCronEnabled := oldRecord.GetBool("shutdown_cron_enabled")
+
+				if newWakeCron != oldWakeCron ||
+					newWakeCronEnabled != oldWakeCronEnabled ||
+					newShutdownCron != oldShutdownCron ||
+					newShutdownCronEnabled != oldShutdownCronEnabled {
+					cronjobs.SetWakeShutdownJobs(App)
 				}
-				for _, job := range cronjobs.CronWakeShutdown.Entries() {
-					cronjobs.CronWakeShutdown.Remove(job.ID)
-				}
-				go cronjobs.RunWakeShutdown(App)
 			}
 			return nil
 		})
 		return nil
 	})
 
-	// refresh the device list on database events
 	App.OnModelAfterCreate().Add(func(e *core.ModelEvent) error {
 		if e.Model.TableName() == "_admins" {
 			if err := setSetupCompleted(); err != nil {
 				logger.Error.Println(err)
 				return err
 			}
-		} else {
-			if err := refreshDeviceList(); err != nil {
+			return nil
+		} else if e.Model.TableName() == "devices" {
+			// when a device is created, give the user all rights to the device he just created
+			deviceRec := e.Model.(*models.Record)
+			userId := deviceRec.GetString("created_by")
+
+			var permissionRec *models.Record
+			permissionRec, err := App.Dao().FindFirstRecordByFilter("permissions",
+				fmt.Sprintf("user.id = '%s'", userId))
+			if err != nil && err.Error() != "sql: no rows in result set" {
 				logger.Error.Println(err)
 				return err
+			} else if permissionRec != nil {
+				permissionRec.Set("read", append(permissionRec.GetStringSlice("read"), deviceRec.Id))
+				permissionRec.Set("update", append(permissionRec.GetStringSlice("update"), deviceRec.Id))
+				permissionRec.Set("delete", append(permissionRec.GetStringSlice("delete"), deviceRec.Id))
+				permissionRec.Set("power", append(permissionRec.GetStringSlice("power"), deviceRec.Id))
+				if err := App.Dao().SaveRecord(permissionRec); err != nil {
+					logger.Error.Println(err)
+					return err
+				}
 			}
 		}
 		return nil
@@ -126,23 +196,21 @@ func StartPocketBase(distDirFS fs.FS) {
 				logger.Error.Println(err)
 				return err
 			}
-		} else {
-			if err := refreshDeviceList(); err != nil {
-				logger.Error.Println(err)
-				return err
-			}
 		}
 		return nil
 	})
 
-	// start pocketbase
+	App.OnTerminate().Add(func(e *core.TerminateEvent) error {
+		cronjobs.StopAll()
+		return nil
+	})
+
 	if err := App.Start(); err != nil {
 		logger.Error.Fatalln(err)
 	}
 }
 
 func importSettings() error {
-	// get first settingsPrivate record
 	settingsPrivateRecords, err := App.Dao().FindRecordsByExpr("settings_private")
 	if err != nil {
 		return err
@@ -156,7 +224,6 @@ func importSettings() error {
 		settingsPrivate = settingsPrivateRecords[0]
 	}
 
-	// get first settingsPublic record
 	settingsPublicRecords, err := App.Dao().FindRecordsByExpr("settings_public")
 	if err != nil {
 		return err
@@ -182,18 +249,15 @@ func importSettings() error {
 		interval = os.Getenv("UPSNAP_INTERVAL")
 	}
 
-	// set private settings
 	settingsPrivate.Set("interval", interval)
 	if scanRange := os.Getenv("UPSNAP_SCAN_RANGE"); scanRange != "" {
 		settingsPrivate.Set("scan_range", scanRange)
 	}
 
-	// set public settings
 	if websiteTitle := os.Getenv("UPSNAP_WEBSITE_TITLE"); websiteTitle != "" {
 		settingsPublic.Set("website_title", websiteTitle)
 	}
 
-	// save records
 	if err := App.Dao().SaveRecord(settingsPrivate); err != nil {
 		return err
 	}
@@ -215,19 +279,11 @@ func resetDeviceStates() error {
 		return err
 	}
 	for _, device := range devices {
-		device.Set("status", "offline")
-		if err := App.Dao().SaveRecord(device); err != nil {
+		d := device
+		d.Set("status", "offline")
+		if err := App.Dao().SaveRecord(d); err != nil {
 			return err
 		}
-	}
-	cronjobs.Devices = devices
-	return nil
-}
-
-func refreshDeviceList() error {
-	var err error
-	if cronjobs.Devices, err = App.Dao().FindRecordsByExpr("devices"); err != nil {
-		return err
 	}
 	return nil
 }
